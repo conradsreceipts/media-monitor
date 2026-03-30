@@ -522,58 +522,53 @@ export async function runMonitoring(
         }
 
         // Deep verification for all articles to be sure
-        const response = await fetchWithRetry(`/api/verify-article?url=${encodeURIComponent(a.uri)}`);
-        if (response.ok) {
-          const verified = await response.json();
-          if (verified.verifiedDate) {
-            const d = new Date(verified.verifiedDate).getTime();
-            if (d < startDateTime || d > endDateTime) {
-              log(`DATE CHECK: [SKIP] ${a.title} verified date ${verified.verifiedDate} is outside range.`);
-              return;
-            }
-            verifiedArticles.push({
-              id: `REF_${verifiedArticles.length + 1}`,
-              title: verified.title || a.title,
-              uri: a.uri,
-              snippet: verified.snippet || a.snippet,
-              pubDate: verified.verifiedDate,
-              status: 'Verified',
-              sphere: 'Unclassified', // Will be set in Step 3
-              subChunk: 'General',    // Will be set in Step 3
-              source: a.source,
-              verifiedDate: verified.verifiedDate
-            });
-          } else {
-            // No date found on page, if RSS had a date we trust it, otherwise we keep as unverified
-            if (a.pubDate) {
-              verifiedArticles.push({
-                id: `REF_${verifiedArticles.length + 1}`,
-                title: a.title,
-                uri: a.uri,
-                snippet: a.snippet,
-                pubDate: a.pubDate,
-                status: 'Verified',
-                sphere: 'Unclassified',
-                subChunk: 'General',
-                source: a.source
-              });
-            } else {
-              log(`DATE CHECK: [WARN] No date found for ${a.title}, keeping as unverified.`);
-              verifiedArticles.push({
-                id: `REF_${verifiedArticles.length + 1}`,
-                title: a.title,
-                uri: a.uri,
-                snippet: a.snippet,
-                pubDate: null,
-                status: 'Unverified',
-                sphere: 'Unclassified',
-                subChunk: 'General',
-                source: a.source
-              });
-            }
+        let verified;
+        try {
+          const response = await fetchWithRetry(`/api/verify-article?url=${encodeURIComponent(a.uri)}`);
+          if (response.ok) {
+            verified = await response.json();
           }
+        } catch (e) {
+          log(`VERIFY ERROR: Vercel blocked for ${a.uri}, trying Gemini Proxy...`);
+        }
+
+        // Fallback: If Vercel is blocked, use Gemini to "visit" the page
+        if (!verified || !verified.verifiedDate) {
+          try {
+            const geminiFetch = await fetchUrlWithGemini(a.uri, apiKey);
+            if (geminiFetch.content) {
+              verified = {
+                title: geminiFetch.title,
+                snippet: geminiFetch.content.substring(0, 500),
+                verifiedDate: geminiFetch.date || a.pubDate || today
+              };
+              log(`VERIFY: [PROXY OK] ${a.title} verified via Gemini.`);
+            }
+          } catch (geminiErr) {
+            log(`VERIFY: [PROXY FAIL] ${a.title} could not be reached via Gemini.`);
+          }
+        }
+
+        if (verified && verified.verifiedDate) {
+          const d = new Date(verified.verifiedDate).getTime();
+          if (d < startDateTime || d > endDateTime) {
+            log(`DATE CHECK: [SKIP] ${a.title} verified date ${verified.verifiedDate} is outside range.`);
+            return;
+          }
+          verifiedArticles.push({
+            id: `REF_${verifiedArticles.length + 1}`,
+            title: verified.title || a.title,
+            uri: a.uri,
+            snippet: verified.snippet || a.snippet,
+            pubDate: verified.verifiedDate,
+            status: 'Verified',
+            sphere: 'Unclassified', // Will be set in Step 3
+            subChunk: 'General',    // Will be set in Step 3
+            source: a.source,
+            verifiedDate: verified.verifiedDate
+          });
         } else {
-          // Verification failed, keep if it has a date
+          // No date found on page, if RSS had a date we trust it, otherwise we keep as unverified
           if (a.pubDate) {
             verifiedArticles.push({
               id: `REF_${verifiedArticles.length + 1}`,
@@ -581,6 +576,19 @@ export async function runMonitoring(
               uri: a.uri,
               snippet: a.snippet,
               pubDate: a.pubDate,
+              status: 'Verified',
+              sphere: 'Unclassified',
+              subChunk: 'General',
+              source: a.source
+            });
+          } else {
+            log(`DATE CHECK: [WARN] No date found for ${a.title}, keeping as unverified.`);
+            verifiedArticles.push({
+              id: `REF_${verifiedArticles.length + 1}`,
+              title: a.title,
+              uri: a.uri,
+              snippet: a.snippet,
+              pubDate: null,
               status: 'Unverified',
               sphere: 'Unclassified',
               subChunk: 'General',
@@ -791,6 +799,51 @@ export async function runMonitoring(
   return currentReport;
 }
 
+
+export async function fetchUrlWithGemini(url: string, userApiKey?: string): Promise<{ content: string; title: string; date?: string }> {
+  const apiKey = (userApiKey && userApiKey.trim()) || getApiKey();
+  const ai = new GoogleGenAI({ apiKey });
+  
+  // Use Flash for speed and cost efficiency
+  const model = "gemini-3-flash-preview";
+  
+  const prompt = `
+    Visit this URL: ${url}
+    
+    TASK:
+    1. Extract the main article text or page content.
+    2. Extract the page title.
+    3. Extract the publication date if visible.
+    
+    Format the response as JSON:
+    {
+      "content": "string",
+      "title": "string",
+      "date": "string (ISO format if possible)"
+    }
+  `;
+
+  try {
+    const response = await callGeminiWithRetry(() => 
+      ai.models.generateContent({
+        model,
+        contents: prompt,
+        config: { 
+          tools: [{ googleSearch: {} }],
+          responseMimeType: "application/json"
+        }
+      })
+    );
+
+    if (response.text) {
+      return JSON.parse(response.text);
+    }
+    throw new Error("No content returned from Gemini");
+  } catch (error) {
+    console.error("Gemini Fetch Error:", error);
+    throw error;
+  }
+}
 
 export async function generateArticleSummary(article: any, userApiKey?: string, selectedModel: string = "gemini-2.5-flash-lite"): Promise<string> {
   const { modelId: activeModel } = getBestModel(selectedModel, '24h');

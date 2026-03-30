@@ -157,23 +157,27 @@ const stealthFetch = async (url: string, returnOnFirstStatus = false, referer?: 
   
   const domain = urlObj.hostname;
   
-  // Enforce domain-specific delay
+  // Enforce domain-specific delay - reduced for health checks
   const now = Date.now();
   const lastTime = lastRequestTime[domain] || 0;
   const timeSinceLast = now - lastTime;
-  if (timeSinceLast < MIN_DOMAIN_DELAY) {
-    await new Promise(resolve => setTimeout(resolve, MIN_DOMAIN_DELAY - timeSinceLast));
+  const delayNeeded = returnOnFirstStatus ? 500 : MIN_DOMAIN_DELAY;
+  if (timeSinceLast < delayNeeded) {
+    await new Promise(resolve => setTimeout(resolve, delayNeeded - timeSinceLast));
   }
   lastRequestTime[domain] = Date.now();
 
   // Try common URL variations if the first one fails
   const urlVariations = [url];
-  if (domain.startsWith('www.')) {
-    urlVariations.push(url.replace('www.', ''));
-  } else {
-    const parts = domain.split('.');
-    if (parts.length === 2) {
-      urlVariations.push(url.replace(domain, 'www.' + domain));
+  // Only try variations if not a health check to save time
+  if (!returnOnFirstStatus) {
+    if (domain.startsWith('www.')) {
+      urlVariations.push(url.replace('www.', ''));
+    } else {
+      const parts = domain.split('.');
+      if (parts.length === 2) {
+        urlVariations.push(url.replace(domain, 'www.' + domain));
+      }
     }
   }
 
@@ -185,9 +189,14 @@ const stealthFetch = async (url: string, returnOnFirstStatus = false, referer?: 
     
     // Try the cached working mode first if it exists
     const cachedMode = workingModeCache[currentDomain];
-    const modes: ('human' | 'direct' | 'googlebot' | 'bingbot' | 'facebook')[] = [
+    let modes: ('human' | 'direct' | 'googlebot' | 'bingbot' | 'facebook')[] = [
       'human', 'direct', 'googlebot', 'bingbot', 'facebook'
     ];
+
+    // For health checks, we only try the most likely modes to avoid timeouts
+    if (returnOnFirstStatus) {
+      modes = ['human', 'direct', 'googlebot'];
+    }
 
     // Reorder modes to put cached mode first
     if (cachedMode) {
@@ -200,8 +209,10 @@ const stealthFetch = async (url: string, returnOnFirstStatus = false, referer?: 
 
     for (const mode of modes) {
       try {
-        // Randomized delays based on mode
-        const delay = mode === 'human' || mode === 'direct' ? Math.random() * 2000 + 1000 : Math.random() * 1000;
+        // Randomized delays based on mode - reduced for health checks
+        const baseDelay = returnOnFirstStatus ? 200 : 1000;
+        const randomDelay = returnOnFirstStatus ? 300 : 2000;
+        const delay = mode === 'human' || mode === 'direct' ? Math.random() * randomDelay + baseDelay : Math.random() * 500;
         await new Promise(resolve => setTimeout(resolve, delay));
         
         let headers: any;
@@ -241,13 +252,35 @@ const stealthFetch = async (url: string, returnOnFirstStatus = false, referer?: 
           }
         }
 
-        const response = await axios.get(targetUrl, {
-          timeout: 30000,
+        const axiosConfig: any = {
+          timeout: returnOnFirstStatus ? 10000 : 30000, // Shorter timeout for health checks
           httpsAgent,
           headers,
           validateStatus: () => true,
           maxRedirects: 5
-        });
+        };
+
+        // Proxy support - allow leaving Vercel's server farm
+        if (process.env.PROXY_URL) {
+          try {
+            const proxyUrl = new URL(process.env.PROXY_URL);
+            axiosConfig.proxy = {
+              host: proxyUrl.hostname,
+              port: parseInt(proxyUrl.port) || (proxyUrl.protocol === 'https:' ? 443 : 80),
+              protocol: proxyUrl.protocol.replace(':', ''),
+            };
+            if (proxyUrl.username && proxyUrl.password) {
+              axiosConfig.proxy.auth = {
+                username: decodeURIComponent(proxyUrl.username),
+                password: decodeURIComponent(proxyUrl.password),
+              };
+            }
+          } catch (e) {
+            console.error(`[PROXY] Invalid PROXY_URL: ${process.env.PROXY_URL}`);
+          }
+        }
+
+        const response = await axios.get(targetUrl, axiosConfig);
         
         finalResponse = response;
 
@@ -270,6 +303,8 @@ const stealthFetch = async (url: string, returnOnFirstStatus = false, referer?: 
           statusText: error.message,
           error: error
         };
+        // If it's a timeout or network error during health check, don't try other modes to save time
+        if (returnOnFirstStatus) break;
       }
     }
   }
@@ -280,29 +315,42 @@ const stealthFetch = async (url: string, returnOnFirstStatus = false, referer?: 
 app.use(express.json());
 
 app.post("/api/check-urls", async (req, res) => {
-  const { urls } = req.body;
-  if (!urls || !Array.isArray(urls)) {
-    return res.status(400).json({ error: "URLs array is required" });
-  }
+  try {
+    const { urls } = req.body;
+    if (!urls || !Array.isArray(urls)) {
+      return res.status(400).json({ error: "URLs array is required" });
+    }
 
-  const results: { url: string; status: number; error?: string }[] = [];
-  
-  // Process in batches of 5 to avoid overwhelming the server or being flagged
-  const batchSize = 5;
-  for (let i = 0; i < urls.length; i += batchSize) {
-    const batch = urls.slice(i, i + batchSize);
-    const batchResults = await Promise.all(batch.map(async (url) => {
-      const response = await stealthFetch(url, true);
-      return { 
-        url, 
-        status: response.status, 
-        error: response.status !== 200 ? response.statusText : undefined 
-      };
-    }));
-    results.push(...batchResults);
-  }
+    const results: { url: string; status: number; error?: string }[] = [];
+    
+    // Process in batches of 5 to avoid overwhelming the server or being flagged
+    const batchSize = 5;
+    for (let i = 0; i < urls.length; i += batchSize) {
+      const batch = urls.slice(i, i + batchSize);
+      const batchResults = await Promise.all(batch.map(async (url) => {
+        try {
+          const response = await stealthFetch(url, true);
+          return { 
+            url, 
+            status: response.status, 
+            error: response.status !== 200 ? response.statusText : undefined 
+          };
+        } catch (e: any) {
+          return {
+            url,
+            status: 500,
+            error: e.message
+          };
+        }
+      }));
+      results.push(...batchResults);
+    }
 
-  res.json(results);
+    res.json(results);
+  } catch (err: any) {
+    console.error("CRITICAL API ERROR [/api/check-urls]:", err);
+    res.status(500).json([{ url: "global", status: 500, error: err.message }]);
+  }
 });
 
 // API routes - Registered synchronously to ensure they are available immediately

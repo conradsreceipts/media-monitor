@@ -77,7 +77,7 @@ import {
   PieChart as PieChartIcon
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { runMonitoring, generateArticleSummary, listAvailableModels, AVAILABLE_MODELS, getUsage, isApiKeyValid } from './services/geminiService';
+import { runMonitoring, generateArticleSummary, listAvailableModels, AVAILABLE_MODELS, getUsage, isApiKeyValid, fetchUrlWithGemini } from './services/geminiService';
 import { MonitoringReport, Article, MonitoringConfig, ReportData, PDFArticleCluster, AppSettings, PdfConfig, MonitoringSummary, PdfPreset } from './types';
 import { pdf } from '@react-pdf/renderer';
 import { MediaIntelligencePDF } from './components/MediaIntelligencePDF';
@@ -579,7 +579,26 @@ export default function App() {
             signal
           });
           
-          const [result] = await response.json();
+          if (!response.ok) {
+            const errorText = await response.text();
+            throw new Error(`HTTP ${response.status}: ${errorText.substring(0, 100)}`);
+          }
+          
+          let [result] = await response.json();
+          
+          // Fallback: If Vercel is blocked (403, 401, 429, or 500), try via Gemini Proxy
+          if (result.status !== 200) {
+            setHealthLog(prev => prev + `(Vercel blocked, trying Gemini Proxy)... `);
+            try {
+              const geminiResult = await fetchUrlWithGemini(source.url);
+              if (geminiResult.content && geminiResult.content.length > 100) {
+                result = { url: source.url, status: 200, statusText: "OK (via Gemini Proxy)" };
+              }
+            } catch (geminiErr) {
+              // If Gemini also fails, we stick with the original error
+            }
+          }
+          
           const resultWithTimestamp = { ...result, lastChecked: now };
           results.push(resultWithTimestamp);
           setSourceHealth([...results]);
@@ -594,10 +613,11 @@ export default function App() {
             setHealthLog(prev => prev + `CANCELLED\n`);
             break;
           }
-          const errorResult = { url: source.url, status: 0, error: 'Fetch failed', lastChecked: now };
+          const errorMessage = err instanceof Error ? err.message : 'Unknown error';
+          const errorResult = { url: source.url, status: 0, error: errorMessage, lastChecked: now };
           results.push(errorResult);
           setSourceHealth([...results]);
-          setHealthLog(prev => prev + `CRITICAL ERROR\n`);
+          setHealthLog(prev => prev + `CRITICAL ERROR: ${errorMessage}\n`);
         }
         
         // Small delay for visual effect and to prevent overwhelming
